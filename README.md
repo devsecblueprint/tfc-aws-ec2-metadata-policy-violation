@@ -1,20 +1,24 @@
 # tfc-aws-ec2-metadata-policy-violation
 
-**Platform:** Terraform Cloud (Free Tier) · **Policy engine:** OPA / Rego · **Time:** ~30 min
+**Platform:** Terraform Cloud (Free Tier) · **Policy engine:** OPA / Rego · **Time:** ~30 min  
+**Org:** `devsecblueprint` · **Workspace:** `tfc-aws-ec2-metadata-policy-violation`
 
-Intentionally vulnerable Terraform configuration that deploys an AWS EC2 instance with
-`http_tokens = "optional"`, allowing IMDSv1 access. A hard-mandatory OPA policy in
-Terraform Cloud blocks the plan until `http_tokens = "required"` is set, enforcing IMDSv2.
+Demonstrates how Terraform Cloud OPA policy enforcement and AWS Service Control Policies
+(SCPs) work together to block EC2 instances that do not enforce IMDSv2. The repository
+ships in the **compliant state** (`http_tokens = "required"`). To observe the deny
+behaviour, revert that one value to `"optional"` — the OPA policy hard-denies the plan,
+and if the policy set is not yet attached, the org-level SCP denies `ec2:RunInstances` at
+the AWS API layer.
 
 ---
 
 ## Why This Matters
 
-IMDSv1 requires no authentication — any process that can reach `169.254.169.254` can retrieve
-the instance role's live IAM credentials. This is the SSRF attack path used in the
-[Capital One breach (2019)](https://aws.amazon.com/blogs/security/defense-in-depth-open-firewalls-reverse-proxies-and-ssrf-vulnerabilities-aws/).
-IMDSv2 breaks that path by requiring a session token obtained via `PUT` before any metadata
-can be read.
+IMDSv1 requires no authentication — any process that can reach `169.254.169.254` can
+retrieve the instance role's live IAM credentials. This is the SSRF attack path exploited
+in the [Capital One breach (2019)](https://aws.amazon.com/blogs/security/defense-in-depth-open-firewalls-reverse-proxies-and-ssrf-vulnerabilities-aws/).
+IMDSv2 breaks that path by requiring a session token obtained via `PUT` before any
+metadata can be read.
 
 Full risk analysis and IMDSv2 mechanics: [docs/imdsv1-security-risks.md](docs/imdsv1-security-risks.md)
 
@@ -27,18 +31,20 @@ tfc-aws-ec2-metadata-policy-violation/
 ├── .github/
 │   └── workflows/
 │       ├── terraform.yml          # fmt check → validate → speculative plan (PR comment)
-│       └── rego-tests.yml         # OPA unit tests for the Rego policy
+│       └── rego-tests.yml         # OPA unit tests via opa test + opa check
 ├── docs/
-│   ├── imdsv1-security-risks.md   # IMDSv1 attack surface; IMDSv2 as the fix
-│   ├── policy-enforcement.md      # TFC setup, failed run output, compliant run output
-│   └── scp-comparison.md          # Governance layering: OPA policies vs SCPs
+│   ├── imdsv1-security-risks.md   # IMDSv1 attack surface; IMDSv2 mechanics
+│   ├── policy-enforcement.md      # TFC OPA setup, failed run output, passing run output
+│   ├── scp-comparison.md          # Governance layering: TFC OPA policies vs SCPs
+│   └── issues.md                  # Documented issues and resolutions from this project
 ├── terraform/
-│   ├── versions.tf                # TFC cloud block + required providers
+│   ├── versions.tf                # TFC cloud block (org: devsecblueprint)
 │   ├── variables.tf               # aws_region variable
-│   └── main.tf                    # EC2 resource — starts noncompliant; fix shown inline
+│   ├── main.tf                    # EC2 resource — compliant by default
+│   └── .terraform.lock.hcl       # Provider lock file (hashicorp/aws v6.48.0)
 └── policies/
-    ├── require_imdsv2.rego        # OPA policy that enforces http_tokens = "required"
-    └── require_imdsv2_test.rego   # OPA unit tests (run by rego-tests.yml)
+    ├── require_imdsv2.rego        # OPA policy: hard-deny if http_tokens != "required"
+    └── require_imdsv2_test.rego   # 13 OPA unit tests (run by rego-tests.yml)
 ```
 
 ---
@@ -47,62 +53,103 @@ tfc-aws-ec2-metadata-policy-violation/
 
 | Requirement | Notes |
 |---|---|
-| Terraform CLI ≥ 1.6 | `brew install terraform` or [download](https://developer.hashicorp.com/terraform/install) |
+| Terraform CLI | [Download](https://developer.hashicorp.com/terraform/install) or `brew install terraform` |
 | Terraform Cloud account | Free at [app.terraform.io](https://app.terraform.io) |
-| AWS account + IAM credentials | `ec2:DescribeImages` for plan; add `ec2:RunInstances` to apply |
+| AWS account + IAM credentials | `ec2:DescribeImages` for plan; `ec2:RunInstances` to apply |
 | Git + VCS provider connected to TFC | GitHub, GitLab, or Bitbucket |
 
-**GitHub repository secrets** required for the Actions workflows:
+**GitHub repository secret** required for the Actions workflows:
 
-| Secret | Where to get it |
+| Secret | Source |
 |---|---|
-| `TF_API_TOKEN` | TFC → User settings → Tokens → Create API token |
+| `TF_API_TOKEN` | TFC → User Settings → Tokens → Create API token (Plan + Write access) |
 
-No OPA CLI required locally — Terraform Cloud runs the policy engine server-side; the
-`rego-tests.yml` workflow installs OPA in CI automatically.
+No OPA CLI required locally — the `rego-tests.yml` workflow installs OPA `v0.68.0` in CI
+automatically. Terraform Cloud runs the policy engine server-side for plan-time checks.
+
+---
+
+## CI Workflows
+
+### `terraform.yml`
+
+Triggers on push to `main` or PRs touching `terraform/**`.
+
+| Job | Runs on | What it does |
+|---|---|---|
+| `fmt` | all events | `terraform fmt -check -recursive` |
+| `validate` | all events | `terraform init` + `terraform validate` via TFC backend |
+| `plan` | PRs only | TFC speculative plan; posts output as a PR comment (updates on re-push) |
+
+On push to `main`, TFC's VCS integration triggers the real plan + apply automatically.
+The `plan` job only runs on PRs to provide early feedback without duplicating the
+VCS-triggered run.
+
+### `rego-tests.yml`
+
+Triggers on push to `main` or PRs touching `policies/**`.
+
+Installs OPA `v0.68.0`, runs `opa test policies/ --verbose` against all 13 unit tests in
+`policies/require_imdsv2_test.rego`, then runs `opa check policies/ --strict` to validate
+policy syntax.
 
 ---
 
 ## Walkthrough
 
-### 1. Configure Terraform Cloud
+### 1. Confirm Workspace Configuration
 
-In `terraform/versions.tf`, replace `"your-org-name"` with your TFC organization name.
+The workspace and org are already configured in `terraform/versions.tf`. AWS credentials
+are set as workspace environment variables in TFC (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`).
 
-Create a workspace named `ec2-imdsv2-demo` with the **Terraform Working Directory** set to
-`terraform/`. Add your AWS credentials as sensitive environment variables
-(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`).
+To authenticate the local CLI:
+
+```bash
+terraform login
+cd terraform && terraform init
+```
 
 ### 2. Attach the OPA Policy Set
 
-In **Settings → Policy sets → Connect a new policy set**, point at this repository with:
+In TFC: **Settings → Policy sets → Connect a new policy set**
 
-- **Policies path:** `policies/`
-- **Policy framework:** OPA
-- **Enforcement level:** Hard mandatory
-- **Scope:** attach to the `ec2-imdsv2-demo` workspace
+| Setting | Value |
+|---|---|
+| VCS repository | this repository |
+| Policies path | `policies/` |
+| Policy framework | OPA |
+| Enforcement level | Hard mandatory |
+| Scope | `tfc-aws-ec2-metadata-policy-violation` workspace |
 
 Full setup steps: [docs/policy-enforcement.md](docs/policy-enforcement.md)
 
-### 3. Trigger the Noncompliant Run
+### 3. Observe the Noncompliant Deny
 
-With `main.tf` in its default state (`http_tokens = "optional"`), initialize and push:
+In `terraform/main.tf`, change `http_tokens = "required"` to `http_tokens = "optional"`,
+then push:
 
 ```bash
-cd terraform
-terraform login
-terraform init
-git add . && git commit -m "demo: noncompliant IMDSv1 configuration"
+git add terraform/main.tf
+git commit -m "demo: revert to noncompliant IMDSv1 configuration"
 git push origin main
 ```
 
-The plan completes, the policy check runs, and the run is **hard-denied**. No apply button
-appears. The violation message names the exact resource and value. Expected output is in
-[docs/policy-enforcement.md § Demonstrating the Hard Deny](docs/policy-enforcement.md#demonstrating-the-hard-deny).
+**With the policy set attached:** TFC hard-denies at the policy check phase — no apply
+button appears.
 
-### 4. Fix and Rerun
+**Without the policy set attached:** The plan passes TFC but the org SCP
+(`p-8sjoex3z`) denies `ec2:RunInstances` at the AWS API layer with a 403:
 
-In `terraform/main.tf`, change `http_tokens = "optional"` to `http_tokens = "required"`.
+```
+api error UnauthorizedOperation: ... with an explicit deny in a service control policy
+```
+
+Both outcomes are documented in [docs/issues.md § Issue 4](docs/issues.md#issue-4--scp-denied-ec2runinstances-when-http_tokens--optional).
+
+### 4. Fix and Confirm the Compliant Run
+
+Revert to `http_tokens = "required"`:
 
 ```bash
 git add terraform/main.tf
@@ -110,30 +157,43 @@ git commit -m "fix: enforce IMDSv2 (http_tokens = required)"
 git push origin main
 ```
 
-The policy check passes. The apply is unblocked. Expected output is in
-[docs/policy-enforcement.md § Fixing the Configuration](docs/policy-enforcement.md#fixing-the-configuration).
+The OPA policy check passes, the SCP condition is satisfied, and the EC2 instance is
+created. In the live demonstration run, the instance was created as `i-01703456fda7dfcf8`
+in `us-east-1`.
 
 ### 5. Understand the Full Control Stack
 
-This OPA policy covers Terraform-managed runs only. Pair it with an SCP on your AWS
-Organization to enforce the same invariant at the API layer for every principal and toolchain.
+The OPA policy covers Terraform-managed runs only. The SCP enforces the same invariant
+universally at the AWS API layer — catching any `ec2:RunInstances` call regardless of
+toolchain. See [docs/scp-comparison.md](docs/scp-comparison.md) for the comparison table,
+SCP JSON, and governance layering diagram.
 
-Comparison, SCP JSON, and governance layering diagram:
-[docs/scp-comparison.md](docs/scp-comparison.md)
+---
+
+## Live Run Results
+
+These results are from the demonstration run against the `devsecblueprint` org.
+
+| Run | `http_tokens` | TFC OPA | AWS SCP | Result |
+|---|---|---|---|---|
+| `run-vhswq1CP4gwJkeui` | `optional` | Passed (`deny_public_sg` only — `require_imdsv2` not yet attached) | **Denied** | No instance created |
+| `run-q4415sdzmcgCxMbm` | `required` | Passed | Allowed | `i-01703456fda7dfcf8` created |
+
+Provider version used: `hashicorp/aws v6.48.0` · Terraform runtime: `v1.15.5 linux_amd64`
 
 ---
 
 ## Cleanup
 
 ```bash
-# Destroy the EC2 instance (if applied)
+# Destroy the running EC2 instance
 cd terraform && terraform destroy -auto-approve
 ```
 
 Then in Terraform Cloud:
 
-1. **Settings → Policy sets** → open the policy set → **Edit → Delete policy set**
-2. Open the `ec2-imdsv2-demo` workspace → **Settings → Destruction and Deletion → Delete from Terraform Cloud**
+1. **Settings → Policy sets** → open `require_imdsv2` → **Edit → Delete policy set**
+2. Open the workspace → **Settings → Destruction and Deletion → Delete from Terraform Cloud**
 
 Remove demo AWS credentials:
 
@@ -141,6 +201,14 @@ Remove demo AWS credentials:
 aws iam delete-access-key --user-name <demo-user> --access-key-id <key-id>
 aws iam delete-user --user-name <demo-user>
 ```
+
+---
+
+## Known Issues
+
+Setup and CI issues encountered during this project — version constraint failures, Node.js
+runtime deprecations, SCP deny on noncompliant apply — are documented with root causes and
+resolutions in [docs/issues.md](docs/issues.md).
 
 ---
 
