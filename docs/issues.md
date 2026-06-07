@@ -106,3 +106,65 @@ Updated all three actions to their latest major versions, which ship with the No
 | `actions/github-script` | `v7` | `v9` |
 
 Both workflow files were updated: `.github/workflows/terraform.yml` and `.github/workflows/rego-tests.yml`.
+
+---
+
+## Issue 4 — SCP Denied `ec2:RunInstances` When `http_tokens = "optional"`
+
+**Symptom**
+
+```
+Error: creating EC2 Instance: operation error EC2: RunInstances,
+https response error StatusCode: 403, RequestID: 23b6df85-...,
+api error UnauthorizedOperation: You are not authorized to perform this
+operation. User: arn:aws:sts::686255946250:assumed-role/terraform-cloud-deployer-oidc/...
+is not authorized to perform: ec2:RunInstances on resource:
+arn:aws:ec2:us-east-1:686255946250:instance/* with an explicit deny in a
+service control policy: arn:aws:organizations::976556613810:policy/
+o-657xnsedg9/service_control_policy/p-8sjoex3z.
+
+Error: Terraform exited with code 1.
+```
+
+**Cause**
+
+The first `terraform apply` run used `http_tokens = "optional"` in `terraform/main.tf`.
+The TFC OPA policy check passed — only the org-wide `aws.ec2.deny_public_sg` policy
+evaluated at that point because the `require_imdsv2` policy set was not yet attached to
+the workspace. However, when TFC called `ec2:RunInstances`, the AWS Organization SCP
+`p-8sjoex3z` denied the request because the `ec2:MetadataHttpTokens` condition key was
+not `"required"`.
+
+This is the API-layer backstop described in [scp-comparison.md](scp-comparison.md): the
+SCP enforces the IMDSv2 invariant universally at the AWS IAM layer, regardless of whether
+the TFC OPA policy set is attached or not.
+
+**Resolution**
+
+Changed `http_tokens = "optional"` to `http_tokens = "required"` in `terraform/main.tf`:
+
+```diff
+  metadata_options {
+    http_endpoint               = "enabled"
+-   http_tokens                 = "optional"
++   http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+```
+
+The subsequent `terraform apply` passed both OPA policy evaluation and the SCP condition,
+and the EC2 instance was successfully created (`i-01703456fda7dfcf8`, `us-east-1`).
+
+**What this demonstrated**
+
+This is a live example of the governance stack working as designed:
+
+| Layer | `http_tokens = "optional"` | `http_tokens = "required"` |
+|---|---|---|
+| TFC OPA (`require_imdsv2`) | Not yet attached — not evaluated | Would pass |
+| TFC OPA (`deny_public_sg`) | Passed | Passed |
+| AWS SCP (`p-8sjoex3z`) | **Denied** `ec2:RunInstances` | Allowed |
+| EC2 instance created | No | **Yes** — `i-01703456fda7dfcf8` |
+
+The SCP acted as the hard backstop, catching the noncompliant configuration at the AWS
+API layer even when the TFC-level OPA control was not in place.

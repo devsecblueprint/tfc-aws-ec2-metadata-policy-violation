@@ -16,12 +16,11 @@ resource "aws_instance" "demo" {
   ami           = data.aws_ami.amazon_linux_2.id
   instance_type = "t3.micro"
 
-  # NONCOMPLIANT: http_tokens = "optional" permits IMDSv1 requests.
-  # The OPA policy will hard-deny this plan.
-  # Change http_tokens to "required" to enforce IMDSv2 and pass the policy.
+  # COMPLIANT: http_tokens = "required" enforces IMDSv2.
+  # Change to "optional" to observe the OPA hard-deny and SCP deny at apply time.
   metadata_options {
     http_endpoint               = "enabled"
-    http_tokens                 = "optional"
+    http_tokens                 = "required"
     http_put_response_hop_limit = 1
   }
 
