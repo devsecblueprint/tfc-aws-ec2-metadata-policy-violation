@@ -1,7 +1,3 @@
-provider "aws" {
-  region = var.aws_region
-}
-
 data "aws_ami" "amazon_linux_2" {
   most_recent = true
   owners      = ["amazon"]
@@ -17,7 +13,7 @@ resource "aws_instance" "demo" {
   instance_type = "t3.micro"
 
   # COMPLIANT: http_tokens = "required" enforces IMDSv2.
-  # Change to "optional" to observe the OPA hard-deny and SCP deny at apply time.
+  # Change to "optional" to observe the OPA hard-deny.
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "optional"

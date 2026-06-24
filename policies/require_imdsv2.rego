@@ -1,16 +1,18 @@
 package terraform.policies.require_imdsv2
 
+import input.plan as plan
 import future.keywords.contains
 import future.keywords.if
 import future.keywords.in
 
-# Actions that create or modify infrastructure (excludes deletes and no-ops)
+# Actions that create or modify infrastructure
 applicable_actions := {"create", "update"}
 
-# HARD DENY: EC2 instance has http_tokens explicitly set to "optional"
+# EC2 instance has IMDSv1 enabled, or does not explicitly require IMDSv2.
 deny contains msg if {
-    some resource in input.resource_changes
+    some resource in plan.resource_changes
     resource.type == "aws_instance"
+
     some action in resource.change.actions
     action in applicable_actions
 
@@ -23,10 +25,11 @@ deny contains msg if {
     )
 }
 
-# HARD DENY: EC2 instance does not define metadata_options at all
+# EC2 instance has no metadata_options block at all.
 deny contains msg if {
-    some resource in input.resource_changes
+    some resource in plan.resource_changes
     resource.type == "aws_instance"
+
     some action in resource.change.actions
     action in applicable_actions
 
