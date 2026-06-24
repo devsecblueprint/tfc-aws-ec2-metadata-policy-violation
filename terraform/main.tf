@@ -20,7 +20,7 @@ resource "aws_instance" "demo" {
   # Change to "optional" to observe the OPA hard-deny and SCP deny at apply time.
   metadata_options {
     http_endpoint               = "enabled"
-    http_tokens                 = "required"
+    http_tokens                 = "optional"
     http_put_response_hop_limit = 1
   }
 
